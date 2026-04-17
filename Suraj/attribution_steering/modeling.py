@@ -26,7 +26,22 @@ def load_model_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype)
+    load_kwargs = {"dtype": torch_dtype}
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            attn_implementation="eager",
+            **load_kwargs,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+
+    set_attn_implementation = getattr(model, "set_attn_implementation", None)
+    if callable(set_attn_implementation):
+        try:
+            set_attn_implementation("eager")
+        except (TypeError, ValueError):
+            pass
     model.to(resolved_device)
     model.eval()
     return model, tokenizer

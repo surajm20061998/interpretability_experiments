@@ -23,7 +23,7 @@ def _node_scores(hidden_states: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
 
 def build_attribution_graph(
     hidden_states: tuple[torch.Tensor, ...],
-    attentions: tuple[torch.Tensor, ...],
+    attentions: tuple[torch.Tensor | None, ...] | None,
     input_ids: torch.Tensor,
     tokenizer: PreTrainedTokenizerBase,
     target_token_id: int,
@@ -47,9 +47,12 @@ def build_attribution_graph(
             )
     top_nodes = sorted(flat_nodes, key=lambda item: item["score"], reverse=True)[:top_k_nodes]
 
+    if attentions is None:
+        attentions = tuple(None for _ in node_scores)
+
     flat_edges: list[dict[str, Any]] = []
-    for layer_index, attention in enumerate(attentions):
-        layer_scores = node_scores[layer_index]
+    for layer_index, layer_scores in enumerate(node_scores):
+        attention = attentions[layer_index] if layer_index < len(attentions) else None
         if attention is None:
             attention_map = torch.full(
                 (layer_scores.shape[0], layer_scores.shape[0]),
