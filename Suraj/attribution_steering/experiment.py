@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 from .attribution import build_attribution_graph, retain_hidden_state_grads
+from .controller import NeuralActivationSteerer, NeuralControllerState, train_hallucination_controller
 from .dataset import answer_is_correct, build_messages, build_prompt, load_dataset, parse_conditions
 from .modeling import decode_new_tokens, load_model_and_tokenizer, render_prompt_for_model
 from .steering import ActivationSteerer, SteeringState, fit_steering_state
@@ -177,6 +178,26 @@ def _summarize_collection(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _load_filtered_activation_data(
+    input_dir: str,
+    fit_conditions: str | list[str] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_path = Path(input_dir)
+    activation_bundle = torch.load(input_path / "activations.pt", map_location="cpu")
+    raw_records = _read_jsonl(input_path / "records.jsonl")
+    selected_conditions = set(parse_conditions(fit_conditions))
+    fit_records = [
+        record for record in activation_bundle["records"] if record["condition"] in selected_conditions
+    ]
+    if not fit_records:
+        raise ValueError("No activation records matched the requested fit conditions.")
+
+    activations = torch.stack([record["activations"] for record in fit_records], dim=0)
+    labels = torch.tensor([record["is_correct"] for record in fit_records], dtype=torch.bool)
+    layer_scores = torch.stack([record["layer_scores"] for record in fit_records], dim=0)
+    return activation_bundle, raw_records, fit_records, activations, labels, layer_scores
+
+
 def collect_dataset(
     model_name: str,
     dataset_path: str,
@@ -289,23 +310,16 @@ def analyze_collection(
     fit_conditions: str | list[str] | None = "misleading",
     top_k_layers: int = 6,
 ) -> dict[str, Any]:
-    input_path = Path(input_dir)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-
-    activation_bundle = torch.load(input_path / "activations.pt", map_location="cpu")
-    raw_records = _read_jsonl(input_path / "records.jsonl")
-    selected_conditions = set(parse_conditions(fit_conditions))
-
-    fit_records = [
-        record for record in activation_bundle["records"] if record["condition"] in selected_conditions
-    ]
-    if not fit_records:
-        raise ValueError("No activation records matched the requested fit conditions.")
-
-    activations = torch.stack([record["activations"] for record in fit_records], dim=0)
-    labels = torch.tensor([record["is_correct"] for record in fit_records], dtype=torch.bool)
-    layer_scores = torch.stack([record["layer_scores"] for record in fit_records], dim=0)
+    (
+        activation_bundle,
+        raw_records,
+        fit_records,
+        activations,
+        labels,
+        layer_scores,
+    ) = _load_filtered_activation_data(input_dir, fit_conditions)
     state = fit_steering_state(
         activations=activations,
         labels=labels,
@@ -321,7 +335,7 @@ def analyze_collection(
 
     summary = {
         "model_name": activation_bundle["model_name"],
-        "fit_conditions": sorted(selected_conditions),
+        "fit_conditions": sorted(parse_conditions(fit_conditions)),
         "num_fit_examples": len(fit_records),
         "num_truthful": int(truthful_mask.sum().item()),
         "num_hallucinated": int(hallucinated_mask.sum().item()),
@@ -337,6 +351,61 @@ def analyze_collection(
         },
     }
     _write_json(output_path / "analysis.json", summary)
+    return summary
+
+
+def train_controller(
+    input_dir: str,
+    output_dir: str,
+    fit_conditions: str | list[str] | None = "misleading",
+    top_k_layers: int = 6,
+    hidden_dim: int = 256,
+    dropout: float = 0.1,
+    epochs: int = 200,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    val_fraction: float = 0.25,
+    random_seed: int = 0,
+) -> dict[str, Any]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    (
+        activation_bundle,
+        _raw_records,
+        fit_records,
+        activations,
+        labels,
+        layer_scores,
+    ) = _load_filtered_activation_data(input_dir, fit_conditions)
+
+    controller_state = train_hallucination_controller(
+        activations=activations,
+        labels=labels,
+        layer_scores=layer_scores,
+        top_k_layers=top_k_layers,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        val_fraction=val_fraction,
+        random_seed=random_seed,
+    )
+    controller_state.save(output_path / "controller_state.pt")
+
+    truthful_mask = labels.bool()
+    hallucinated_mask = ~truthful_mask
+    summary = {
+        "model_name": activation_bundle["model_name"],
+        "fit_conditions": sorted(parse_conditions(fit_conditions)),
+        "num_fit_examples": len(fit_records),
+        "num_truthful": int(truthful_mask.sum().item()),
+        "num_hallucinated": int(hallucinated_mask.sum().item()),
+        "selected_layers": controller_state.steering_state.selected_layers,
+        "threshold": controller_state.threshold,
+        "training_summary": controller_state.training_summary,
+    }
+    _write_json(output_path / "controller_summary.json", summary)
     return summary
 
 
@@ -396,4 +465,69 @@ def evaluate_steering(
     }
     _write_jsonl(output_path / "steering_records.jsonl", records)
     _write_json(output_path / "steering_summary.json", summary)
+    return summary
+
+
+def evaluate_neural_controller(
+    model_name: str,
+    dataset_path: str,
+    controller_state_path: str,
+    output_dir: str,
+    device: str | None = None,
+    max_new_tokens: int = 8,
+    max_examples: int | None = None,
+    conditions: str | list[str] | None = None,
+    steering_scale: float = 2.0,
+) -> dict[str, Any]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    model, tokenizer = load_model_and_tokenizer(model_name, device=device)
+    controller_state = NeuralControllerState.load(controller_state_path)
+    examples = load_dataset(dataset_path, limit=max_examples)
+    requested_conditions = parse_conditions(conditions)
+
+    records: list[dict[str, Any]] = []
+    for example in tqdm(examples, desc="neural-steering"):
+        for condition in requested_conditions:
+            prompt, model_prompt, _messages = _prepare_prompts(tokenizer, example, condition)
+            baseline = generate_answer(model, tokenizer, model_prompt, max_new_tokens=max_new_tokens)
+            steered = generate_answer(
+                model,
+                tokenizer,
+                model_prompt,
+                max_new_tokens=max_new_tokens,
+                steerer=NeuralActivationSteerer(
+                    model,
+                    controller_state,
+                    steering_scale=steering_scale,
+                ),
+            )
+
+            baseline_correct = answer_is_correct(baseline["text"], example)
+            steered_correct = answer_is_correct(steered["text"], example)
+            records.append(
+                {
+                    "example_id": example.id,
+                    "condition": condition,
+                    "question": example.question,
+                    "answer": example.answer,
+                    "prompt": prompt,
+                    "model_prompt": model_prompt,
+                    "baseline_text": baseline["text"],
+                    "baseline_correct": baseline_correct,
+                    "steered_text": steered["text"],
+                    "steered_correct": steered_correct,
+                }
+            )
+
+    summary = {
+        "num_records": len(records),
+        "controller_threshold": controller_state.threshold,
+        "selected_layers": controller_state.steering_state.selected_layers,
+        "baseline_accuracy_by_condition": _accuracy_by_condition(records, key="baseline_correct"),
+        "steered_accuracy_by_condition": _accuracy_by_condition(records, key="steered_correct"),
+    }
+    _write_jsonl(output_path / "controller_steering_records.jsonl", records)
+    _write_json(output_path / "controller_steering_summary.json", summary)
     return summary

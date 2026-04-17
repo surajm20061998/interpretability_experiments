@@ -10,6 +10,11 @@ The workflow is:
 4. Fit per-layer steering vectors from the contrast between truthful and hallucinated traces.
 5. Re-run the same prompts with steering enabled only when the live activation looks more hallucination-like than truthful.
 
+There are now two steering paths:
+
+- `analyze` + `steer`: centroid-based baseline steering
+- `train-controller` + `steer-controller`: learned neural controller that predicts hallucination-like activations and gates steering online
+
 ## What "attribution graph" means here
 
 This implementation is intentionally lightweight and reproducible:
@@ -71,6 +76,30 @@ python3 -m attribution_steering.cli steer \
   --steering-scale 2.0
 ```
 
+Train the neural controller on the cached activations:
+
+```bash
+python3 -m attribution_steering.cli train-controller \
+  --input-dir runs/qwen25_3b_collect \
+  --output-dir runs/qwen25_3b_controller \
+  --fit-conditions misleading \
+  --top-k-layers 4 \
+  --hidden-dim 256 \
+  --epochs 200
+```
+
+Evaluate baseline versus controller-guided steering:
+
+```bash
+python3 -m attribution_steering.cli steer-controller \
+  --model Qwen/Qwen2.5-3B-Instruct \
+  --dataset datasets/factual_conflict.jsonl \
+  --controller-state runs/qwen25_3b_controller/controller_state.pt \
+  --output-dir runs/qwen25_3b_controller_steer \
+  --max-examples 12 \
+  --steering-scale 1.0
+```
+
 ## Output Artifacts
 
 `collect` writes:
@@ -88,6 +117,16 @@ python3 -m attribution_steering.cli steer \
 
 - `steering_records.jsonl`: baseline vs steered answers
 - `steering_summary.json`: per-condition accuracy comparison
+
+`train-controller` writes:
+
+- `controller_state.pt`: learned controller weights plus steering directions
+- `controller_summary.json`: training metrics, threshold, and selected layers
+
+`steer-controller` writes:
+
+- `controller_steering_records.jsonl`: baseline vs neural-controller-steered answers
+- `controller_steering_summary.json`: per-condition accuracy comparison
 
 ## Notes
 
