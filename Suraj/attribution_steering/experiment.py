@@ -10,8 +10,8 @@ import torch
 from tqdm import tqdm
 
 from .attribution import build_attribution_graph, retain_hidden_state_grads
-from .dataset import answer_is_correct, build_prompt, load_dataset, parse_conditions
-from .modeling import decode_new_tokens, load_model_and_tokenizer
+from .dataset import answer_is_correct, build_messages, build_prompt, load_dataset, parse_conditions
+from .modeling import decode_new_tokens, load_model_and_tokenizer, render_prompt_for_model
 from .steering import ActivationSteerer, SteeringState, fit_steering_state
 
 
@@ -44,6 +44,13 @@ def _move_encoding(encoded: dict[str, torch.Tensor], device: str) -> dict[str, t
 
 def _select_next_token(logits: torch.Tensor) -> torch.Tensor:
     return torch.argmax(logits, dim=-1, keepdim=True)
+
+
+def _prepare_prompts(tokenizer: Any, example: Any, condition: str) -> tuple[str, str, list[dict[str, str]]]:
+    prompt = build_prompt(example, condition)
+    messages = build_messages(example, condition)
+    model_prompt = render_prompt_for_model(tokenizer, prompt, messages=messages)
+    return prompt, model_prompt, messages
 
 
 def run_prompt_trace(
@@ -190,9 +197,14 @@ def collect_dataset(
     activation_records: list[dict[str, Any]] = []
     for example in tqdm(examples, desc="collecting"):
         for condition in requested_conditions:
-            prompt = build_prompt(example, condition)
-            trace = run_prompt_trace(model, tokenizer, prompt)
-            generation = generate_answer(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
+            prompt, model_prompt, messages = _prepare_prompts(tokenizer, example, condition)
+            trace = run_prompt_trace(model, tokenizer, model_prompt)
+            generation = generate_answer(
+                model,
+                tokenizer,
+                model_prompt,
+                max_new_tokens=max_new_tokens,
+            )
             is_correct = answer_is_correct(generation["text"], example)
 
             record = {
@@ -202,6 +214,8 @@ def collect_dataset(
                 "answer": example.answer,
                 "aliases": list(example.aliases),
                 "prompt": prompt,
+                "model_prompt": model_prompt,
+                "messages": messages,
                 "generated_text": generation["text"],
                 "generated_token_ids": generation["token_ids"],
                 "is_correct": is_correct,
@@ -348,12 +362,12 @@ def evaluate_steering(
     records: list[dict[str, Any]] = []
     for example in tqdm(examples, desc="steering"):
         for condition in requested_conditions:
-            prompt = build_prompt(example, condition)
-            baseline = generate_answer(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
+            prompt, model_prompt, _messages = _prepare_prompts(tokenizer, example, condition)
+            baseline = generate_answer(model, tokenizer, model_prompt, max_new_tokens=max_new_tokens)
             steered = generate_answer(
                 model,
                 tokenizer,
-                prompt,
+                model_prompt,
                 max_new_tokens=max_new_tokens,
                 steerer=ActivationSteerer(model, state, steering_scale=steering_scale),
             )
@@ -367,6 +381,7 @@ def evaluate_steering(
                     "question": example.question,
                     "answer": example.answer,
                     "prompt": prompt,
+                    "model_prompt": model_prompt,
                     "baseline_text": baseline["text"],
                     "baseline_correct": baseline_correct,
                     "steered_text": steered["text"],

@@ -77,12 +77,7 @@ def answer_is_correct(prediction: str, example: FactExample) -> bool:
     return False
 
 
-def build_prompt(
-    example: FactExample,
-    condition: str,
-    instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
-) -> str:
-    condition = condition.lower()
+def _context_for_condition(example: FactExample, condition: str) -> str:
     context_map = {
         "clean": example.clean_context,
         "misleading": example.misleading_context,
@@ -92,13 +87,37 @@ def build_prompt(
         raise ValueError(
             f"Unsupported condition '{condition}'. Expected one of {sorted(context_map)}."
         )
+    return context_map[condition].strip()
 
-    context = context_map[condition].strip()
-    sections = [instruction.strip(), "", f"Question: {example.question.strip()}"]
+
+def build_user_prompt(example: FactExample, condition: str) -> str:
+    condition = condition.lower()
+    context = _context_for_condition(example, condition)
+    sections = [f"Question: {example.question.strip()}"]
     if context:
         sections.append(f"Retrieved note: {context}")
     sections.append("Answer:")
     return "\n".join(sections)
+
+
+def build_messages(
+    example: FactExample,
+    condition: str,
+    instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": instruction.strip()},
+        {"role": "user", "content": build_user_prompt(example, condition)},
+    ]
+
+
+def build_prompt(
+    example: FactExample,
+    condition: str,
+    instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
+) -> str:
+    user_prompt = build_user_prompt(example, condition)
+    return "\n".join([instruction.strip(), "", user_prompt])
 
 
 def parse_conditions(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:

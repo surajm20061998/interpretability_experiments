@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
@@ -56,3 +56,19 @@ def decode_new_tokens(
     prompt_length = prompt_ids.shape[-1]
     new_ids = full_ids[0, prompt_length:]
     return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+
+def render_prompt_for_model(
+    tokenizer: PreTrainedTokenizerBase,
+    prompt: str,
+    messages: list[Mapping[str, str]] | None = None,
+) -> str:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if messages and chat_template and callable(apply_chat_template):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return prompt

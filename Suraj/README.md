@@ -39,12 +39,22 @@ python3 -m attribution_steering.cli collect \
   --max-examples 12
 ```
 
+For Qwen Instruct, the closest official checkpoint name is `Qwen/Qwen2.5-3B-Instruct` rather than `Qwen 2.5B`. The code now automatically uses the tokenizer chat template when the model provides one, which is important for instruct-tuned models.
+
+```bash
+python3 -m attribution_steering.cli collect \
+  --model Qwen/Qwen2.5-3B-Instruct \
+  --dataset datasets/factual_conflict.jsonl \
+  --output-dir runs/qwen25_3b_collect \
+  --max-examples 12
+```
+
 Fit a steering state from misleading-condition traces:
 
 ```bash
 python3 -m attribution_steering.cli analyze \
-  --input-dir runs/gpt2_collect \
-  --output-dir runs/gpt2_analysis \
+  --input-dir runs/qwen25_3b_collect \
+  --output-dir runs/qwen25_3b_analysis \
   --fit-conditions misleading \
   --top-k-layers 4
 ```
@@ -53,10 +63,10 @@ Evaluate baseline versus steered generations:
 
 ```bash
 python3 -m attribution_steering.cli steer \
-  --model gpt2 \
+  --model Qwen/Qwen2.5-3B-Instruct \
   --dataset datasets/factual_conflict.jsonl \
-  --steering-state runs/gpt2_analysis/steering_state.pt \
-  --output-dir runs/gpt2_steer \
+  --steering-state runs/qwen25_3b_analysis/steering_state.pt \
+  --output-dir runs/qwen25_3b_steer \
   --max-examples 12 \
   --steering-scale 2.0
 ```
@@ -83,4 +93,5 @@ python3 -m attribution_steering.cli steer \
 
 - The included dataset is a starter benchmark, not a publishable hallucination benchmark.
 - Small base models may fail on both clean and misleading conditions. That is still useful because the pipeline will show where the traces diverge.
+- On Apple Silicon, you can add `--device mps`. On NVIDIA GPUs, CUDA will be auto-detected.
 - If you want stronger experiments, the next step is to replace the dataset with a larger factual benchmark and swap the current graph proxy for a richer attribution method.
