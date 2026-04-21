@@ -18,25 +18,42 @@ mkdir -p "$(dirname "${ENV_PREFIX}")"
 mkdir -p "${PKGS_DIR}"
 
 export CONDA_PKGS_DIRS="${PKGS_DIR}"
+export CONDA_NO_PLUGINS="true"
+
+run_conda_env() {
+  if conda env --help >/dev/null 2>&1; then
+    conda env "$@"
+    return
+  fi
+
+  if command -v conda-env >/dev/null 2>&1; then
+    conda-env "$@"
+    return
+  fi
+
+  echo "Could not find a usable 'conda env' or 'conda-env' command." >&2
+  exit 1
+}
 
 if [ -d "${ENV_PREFIX}" ]; then
   echo "Updating existing conda environment at: ${ENV_PREFIX}"
-  conda --no-plugins env update \
+  run_conda_env update \
     --prefix "${ENV_PREFIX}" \
     --file "${ENV_FILE}" \
-    --prune \
-    --override-channels \
-    --channel conda-forge
+    --prune
 else
   echo "Creating conda environment at: ${ENV_PREFIX}"
-  conda --no-plugins env create \
+  run_conda_env create \
     --prefix "${ENV_PREFIX}" \
-    --file "${ENV_FILE}" \
-    --override-channels \
-    --channel conda-forge
+    --file "${ENV_FILE}"
 fi
 
-ENV_PREFIX="$(conda --no-plugins run --prefix "${ENV_PREFIX}" python -c 'import sys; print(sys.prefix)' | tail -n 1)"
+PYTHON_BIN="${ENV_PREFIX}/bin/python"
+if [ ! -x "${PYTHON_BIN}" ]; then
+  echo "Expected Python executable was not found at ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
 ACTIVATE_DIR="${ENV_PREFIX}/etc/conda/activate.d"
 DEACTIVATE_DIR="${ENV_PREFIX}/etc/conda/deactivate.d"
 
@@ -52,7 +69,7 @@ cp "${REPO_ROOT}/conda_hooks/qwen_context_bloat_deactivate.sh" \
 chmod +x "${ACTIVATE_DIR}/qwen_context_bloat.sh" "${DEACTIVATE_DIR}/qwen_context_bloat.sh"
 
 echo "Registering a Jupyter kernel for ${ENV_PREFIX}"
-conda --no-plugins run --prefix "${ENV_PREFIX}" python -m ipykernel install --user \
+"${PYTHON_BIN}" -m ipykernel install --user \
   --name "${KERNEL_NAME}" \
   --display-name "${KERNEL_DISPLAY_NAME}"
 
