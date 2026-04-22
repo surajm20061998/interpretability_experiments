@@ -151,6 +151,15 @@ cells = [
             sink_total_length: int = 4096
             sink_prefix_lengths: tuple[int, ...] = (0, 64, 256, 512)
             sink_answer_position: float = 0.70
+            forced_decoy_total_length: int = 4096
+            forced_decoy_answer_position: float = 0.50
+            forced_decoy_counts: tuple[int, ...] = (0, 2, 4, 8)
+            answer_like_sink_total_length: int = 4096
+            answer_like_sink_answer_position: float = 0.70
+            answer_like_sink_prefix_lengths: tuple[int, ...] = (0, 64, 256, 512)
+            majority_conflict_total_length: int = 4096
+            majority_conflict_answer_position: float = 0.45
+            majority_conflict_repeats: tuple[int, ...] = (0, 2, 4, 8)
             filler_types: tuple[str, ...] = ("natural", "boilerplate", "code", "table")
             attention_probe_examples: int = 3
             attention_max_prompt_tokens: int = 4096
@@ -298,6 +307,59 @@ cells = [
             noun = NOUNS[(index * 3 + salt) % len(NOUNS)].upper()
             number = 10000 + index + salt * 17
             return f"{adjective}-{noun}-{number}"
+
+
+        def mutate_answer_suffix(answer_text: str, offset: int) -> str:
+            parts = answer_text.split("-")
+            if parts and parts[-1].isdigit():
+                parts[-1] = str(int(parts[-1]) + offset)
+                return "-".join(parts)
+            return f"{answer_text}-{offset}"
+
+
+        def build_decoy_answers(
+            example: dict[str, Any],
+            count: int,
+            seed: int,
+            start_offset: int = 2000,
+        ) -> list[str]:
+            rng = random.Random(seed)
+            offsets = [start_offset + 17 * index for index in range(max(count, 1) * 3)]
+            rng.shuffle(offsets)
+            decoys: list[str] = []
+            for offset in offsets:
+                candidate = mutate_answer_suffix(example["answer"], offset)
+                if candidate != example["answer"] and candidate not in decoys:
+                    decoys.append(candidate)
+                if len(decoys) == count:
+                    break
+            return decoys
+
+
+        def build_record_block_parts(
+            tokenizer: Any,
+            *,
+            title: str,
+            employee_id: str,
+            project_code: str,
+            verification_status: str,
+            answer_text: str,
+            note: str | None = None,
+        ) -> tuple[list[int], list[int], list[int]]:
+            prefix_text = (
+                f"{title}:\\n"
+                f"Employee ID: {employee_id}\\n"
+                f"Project codename: {project_code}\\n"
+                f"Verification status: {verification_status}\\n"
+            )
+            if note:
+                prefix_text += f"Record note: {note}\\n"
+            prefix_text += "Security answer: "
+            return (
+                encode_text(tokenizer, prefix_text),
+                encode_text(tokenizer, answer_text),
+                encode_text(tokenizer, "\\n"),
+            )
 
 
         def build_example_bank(num_examples: int, seed: int) -> list[dict[str, Any]]:
@@ -537,6 +599,333 @@ cells = [
                 "candidate_answers": answer_by_location,
                 "candidate_spans": candidate_spans,
             }
+
+
+        def build_forced_decoy_density_prompt(
+            tokenizer: Any,
+            example: dict[str, Any],
+            total_tokens: int,
+            decoy_count: int,
+            answer_position: float,
+            filler_type: str,
+            seed: int,
+        ) -> dict[str, Any]:
+            intro_ids = encode_text(
+                tokenizer,
+                "The document contains many answer-like stale records.\\n"
+                "Use only the verified record and return only the verified security answer.\\n\\n"
+                "Document:\\n",
+            )
+            suffix_ids = encode_text(tokenizer, "\\nQuestion: What is the verified security answer?\\nAnswer:")
+
+            true_prefix_ids, true_answer_ids, true_suffix_ids = build_record_block_parts(
+                tokenizer,
+                title="Verified record",
+                employee_id=example["employee_id"],
+                project_code=example["project_code"],
+                verification_status="verified",
+                answer_text=example["answer"],
+                note="This is the only approved record.",
+            )
+
+            decoy_answers = build_decoy_answers(example, decoy_count, seed=seed, start_offset=2000)
+            before_count = decoy_count // 3
+            before_answers = decoy_answers[:before_count]
+            after_answers = decoy_answers[before_count:]
+
+            before_blocks = [
+                build_record_block_parts(
+                    tokenizer,
+                    title=f"Archived record {index + 1}",
+                    employee_id=example["employee_id"],
+                    project_code=example["project_code"],
+                    verification_status="stale",
+                    answer_text=answer_text,
+                    note="Historical copy. Do not trust without verification.",
+                )
+                for index, answer_text in enumerate(before_answers)
+            ]
+            after_blocks = [
+                build_record_block_parts(
+                    tokenizer,
+                    title=f"Escalation note {index + 1}",
+                    employee_id=example["employee_id"],
+                    project_code=example["project_code"],
+                    verification_status="unverified",
+                    answer_text=answer_text,
+                    note="Answer-like distractor inserted for audit stress testing.",
+                )
+                for index, answer_text in enumerate(after_answers)
+            ]
+
+            fixed_tokens = (
+                len(intro_ids)
+                + len(suffix_ids)
+                + len(true_prefix_ids)
+                + len(true_answer_ids)
+                + len(true_suffix_ids)
+            )
+            fixed_tokens += sum(
+                len(prefix_ids) + len(answer_ids) + len(suffix_piece_ids)
+                for prefix_ids, answer_ids, suffix_piece_ids in (*before_blocks, *after_blocks)
+            )
+
+            filler_budget = total_tokens - fixed_tokens
+            if filler_budget < 0:
+                raise ValueError(
+                    f"Forced-decoy prompt length {total_tokens} is too small for the fixed template ({fixed_tokens} tokens)."
+                )
+
+            desired_answer_start = int(round(total_tokens * answer_position))
+            fixed_before_answer = len(intro_ids)
+            fixed_before_answer += sum(
+                len(prefix_ids) + len(answer_ids) + len(suffix_piece_ids)
+                for prefix_ids, answer_ids, suffix_piece_ids in before_blocks
+            )
+            fixed_before_answer += len(true_prefix_ids)
+
+            pre_target = max(0, min(filler_budget, desired_answer_start - fixed_before_answer))
+            remainder = filler_budget - pre_target
+            post_lead_target = int(round(remainder * 0.20))
+            post_tail_target = remainder - post_lead_target
+
+            pre_ids = build_filler_ids(tokenizer, pre_target, filler_type, seed=seed + 1)
+            post_lead_ids = build_filler_ids(tokenizer, post_lead_target, filler_type, seed=seed + 2)
+            post_tail_ids = build_filler_ids(tokenizer, post_tail_target, filler_type, seed=seed + 3)
+
+            prompt_ids = list(intro_ids)
+            for prefix_ids, answer_ids, suffix_piece_ids in before_blocks:
+                prompt_ids.extend(prefix_ids)
+                prompt_ids.extend(answer_ids)
+                prompt_ids.extend(suffix_piece_ids)
+            prompt_ids.extend(pre_ids)
+
+            answer_start = len(prompt_ids) + len(true_prefix_ids)
+            answer_end = answer_start + len(true_answer_ids)
+            prompt_ids.extend(true_prefix_ids)
+            prompt_ids.extend(true_answer_ids)
+            prompt_ids.extend(true_suffix_ids)
+            prompt_ids.extend(post_lead_ids)
+
+            for prefix_ids, answer_ids, suffix_piece_ids in after_blocks:
+                prompt_ids.extend(prefix_ids)
+                prompt_ids.extend(answer_ids)
+                prompt_ids.extend(suffix_piece_ids)
+
+            prompt_ids.extend(post_tail_ids)
+            prompt_ids.extend(suffix_ids)
+
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_text": decode_ids(tokenizer, prompt_ids),
+                "answer_text": example["answer"],
+                "answer_ids": true_answer_ids,
+                "relevant_span": (answer_start, answer_end),
+                "sink_span": (0, min(CONFIG.sink_ratio_tokens, len(prompt_ids))),
+                "observed_answer_position": answer_start / max(1, len(prompt_ids)),
+                "decoy_count": decoy_count,
+            }
+
+
+        def build_answer_like_sink_prefix_ids(
+            tokenizer: Any,
+            example: dict[str, Any],
+            target_tokens: int,
+            seed: int,
+        ) -> list[int]:
+            if target_tokens <= 0:
+                return []
+            decoy_answers = build_decoy_answers(example, count=6, seed=seed, start_offset=4000)
+            blocks = [
+                encode_text(
+                    tokenizer,
+                    "Archived answer note:\\n"
+                    f"Security answer: {answer_text}\\n"
+                    "Status: stale header. Ignore for current verification.\\n",
+                )
+                for answer_text in decoy_answers
+            ]
+            rng = random.Random(seed)
+            token_ids: list[int] = []
+            while len(token_ids) < target_tokens:
+                token_ids.extend(list(rng.choice(blocks)))
+            return token_ids[:target_tokens]
+
+
+        def build_answer_like_sink_prompt(
+            tokenizer: Any,
+            example: dict[str, Any],
+            total_tokens: int,
+            sink_prefix_tokens: int,
+            answer_position: float,
+            filler_type: str,
+            seed: int,
+        ) -> dict[str, Any]:
+            intro_ids = encode_text(
+                tokenizer,
+                "The document contains stale answer-like headers before the verified record.\\n"
+                "Return only the verified security answer.\\n\\n"
+                "Document:\\n",
+            )
+            suffix_ids = encode_text(tokenizer, "\\nQuestion: What is the verified security answer?\\nAnswer:")
+            sink_ids = build_answer_like_sink_prefix_ids(
+                tokenizer=tokenizer,
+                example=example,
+                target_tokens=sink_prefix_tokens,
+                seed=seed,
+            )
+            true_prefix_ids, true_answer_ids, true_suffix_ids = build_record_block_parts(
+                tokenizer,
+                title="Verified record",
+                employee_id=example["employee_id"],
+                project_code=example["project_code"],
+                verification_status="verified",
+                answer_text=example["answer"],
+                note="Current approved answer.",
+            )
+
+            fixed_tokens = (
+                len(intro_ids)
+                + len(sink_ids)
+                + len(true_prefix_ids)
+                + len(true_answer_ids)
+                + len(true_suffix_ids)
+                + len(suffix_ids)
+            )
+            filler_budget = total_tokens - fixed_tokens
+            if filler_budget < 0:
+                raise ValueError(
+                    f"Answer-like sink prompt length {total_tokens} is too small for the fixed template ({fixed_tokens} tokens)."
+                )
+
+            desired_answer_start = int(round(total_tokens * answer_position))
+            fixed_before_answer = len(intro_ids) + len(sink_ids) + len(true_prefix_ids)
+            pre_target = max(0, min(filler_budget, desired_answer_start - fixed_before_answer))
+            post_target = filler_budget - pre_target
+            pre_ids = build_filler_ids(tokenizer, pre_target, filler_type, seed=seed + 1)
+            post_ids = build_filler_ids(tokenizer, post_target, filler_type, seed=seed + 2)
+
+            prompt_ids = (
+                intro_ids
+                + sink_ids
+                + pre_ids
+                + true_prefix_ids
+                + true_answer_ids
+                + true_suffix_ids
+                + post_ids
+                + suffix_ids
+            )
+            answer_start = len(intro_ids) + len(sink_ids) + len(pre_ids) + len(true_prefix_ids)
+            answer_end = answer_start + len(true_answer_ids)
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_text": decode_ids(tokenizer, prompt_ids),
+                "answer_text": example["answer"],
+                "answer_ids": true_answer_ids,
+                "relevant_span": (answer_start, answer_end),
+                "sink_span": (0, min(CONFIG.sink_ratio_tokens, len(prompt_ids))),
+                "observed_answer_position": answer_start / max(1, len(prompt_ids)),
+                "answer_like_sink_tokens": sink_prefix_tokens,
+            }
+
+
+        def build_majority_conflict_prompt(
+            tokenizer: Any,
+            example: dict[str, Any],
+            total_tokens: int,
+            majority_repeats: int,
+            answer_position: float,
+            filler_type: str,
+            seed: int,
+        ) -> dict[str, Any]:
+            intro_ids = encode_text(
+                tokenizer,
+                "Several stale copies repeat the same outdated answer.\\n"
+                "Exactly one verified record is current. Use only the verified record and return only its security answer.\\n\\n"
+                "Document:\\n",
+            )
+            suffix_ids = encode_text(tokenizer, "\\nQuestion: What is the current verified security answer?\\nAnswer:")
+
+            majority_decoy_answer = mutate_answer_suffix(example["answer"], 6000)
+            true_prefix_ids, true_answer_ids, true_suffix_ids = build_record_block_parts(
+                tokenizer,
+                title="Verified record",
+                employee_id=example["employee_id"],
+                project_code=example["project_code"],
+                verification_status="verified",
+                answer_text=example["answer"],
+                note="Current approved answer.",
+            )
+            majority_blocks = [
+                build_record_block_parts(
+                    tokenizer,
+                    title=f"Stale copy {index + 1}",
+                    employee_id=example["employee_id"],
+                    project_code=example["project_code"],
+                    verification_status="stale",
+                    answer_text=majority_decoy_answer,
+                    note="Repeated outdated answer. Do not use.",
+                )
+                for index in range(majority_repeats)
+            ]
+
+            fixed_tokens = (
+                len(intro_ids)
+                + len(suffix_ids)
+                + len(true_prefix_ids)
+                + len(true_answer_ids)
+                + len(true_suffix_ids)
+            )
+            fixed_tokens += sum(
+                len(prefix_ids) + len(answer_ids) + len(suffix_piece_ids)
+                for prefix_ids, answer_ids, suffix_piece_ids in majority_blocks
+            )
+
+            filler_budget = total_tokens - fixed_tokens
+            if filler_budget < 0:
+                raise ValueError(
+                    f"Majority-conflict prompt length {total_tokens} is too small for the fixed template ({fixed_tokens} tokens)."
+                )
+
+            desired_answer_start = int(round(total_tokens * answer_position))
+            fixed_before_answer = len(intro_ids) + len(true_prefix_ids)
+            pre_target = max(0, min(filler_budget, desired_answer_start - fixed_before_answer))
+            remainder = filler_budget - pre_target
+            bridge_target = int(round(remainder * 0.15))
+            tail_target = remainder - bridge_target
+
+            pre_ids = build_filler_ids(tokenizer, pre_target, filler_type, seed=seed + 1)
+            bridge_ids = build_filler_ids(tokenizer, bridge_target, filler_type, seed=seed + 2)
+            tail_ids = build_filler_ids(tokenizer, tail_target, filler_type, seed=seed + 3)
+
+            prompt_ids = list(intro_ids)
+            prompt_ids.extend(pre_ids)
+            answer_start = len(prompt_ids) + len(true_prefix_ids)
+            answer_end = answer_start + len(true_answer_ids)
+            prompt_ids.extend(true_prefix_ids)
+            prompt_ids.extend(true_answer_ids)
+            prompt_ids.extend(true_suffix_ids)
+            prompt_ids.extend(bridge_ids)
+
+            for prefix_ids, answer_ids, suffix_piece_ids in majority_blocks:
+                prompt_ids.extend(prefix_ids)
+                prompt_ids.extend(answer_ids)
+                prompt_ids.extend(suffix_piece_ids)
+
+            prompt_ids.extend(tail_ids)
+            prompt_ids.extend(suffix_ids)
+
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_text": decode_ids(tokenizer, prompt_ids),
+                "answer_text": example["answer"],
+                "answer_ids": true_answer_ids,
+                "relevant_span": (answer_start, answer_end),
+                "sink_span": (0, min(CONFIG.sink_ratio_tokens, len(prompt_ids))),
+                "observed_answer_position": answer_start / max(1, len(prompt_ids)),
+                "majority_decoy_answer": majority_decoy_answer,
+                "majority_repeats": majority_repeats,
+            }
         """
     ),
     markdown_cell(
@@ -576,7 +965,7 @@ cells = [
                 tokenizer.pad_token = tokenizer.eos_token
 
             model_kwargs = {
-                "torch_dtype": torch_dtype,
+                "dtype": torch_dtype,
             }
             try:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -599,6 +988,10 @@ cells = [
 
             if getattr(model.generation_config, "pad_token_id", None) is None:
                 model.generation_config.pad_token_id = tokenizer.pad_token_id
+            model.generation_config.do_sample = False
+            for generation_attr in ("temperature", "top_p", "top_k"):
+                if hasattr(model.generation_config, generation_attr):
+                    setattr(model.generation_config, generation_attr, None)
 
             return model, tokenizer, resolved_device
 
@@ -884,6 +1277,18 @@ cells = [
         sink_results = pd.DataFrame()
         sink_attention = pd.DataFrame()
         sink_drift = pd.DataFrame()
+
+        forced_decoy_results = pd.DataFrame()
+        forced_decoy_attention = pd.DataFrame()
+        forced_decoy_drift = pd.DataFrame()
+
+        answer_like_sink_results = pd.DataFrame()
+        answer_like_sink_attention = pd.DataFrame()
+        answer_like_sink_drift = pd.DataFrame()
+
+        majority_conflict_results = pd.DataFrame()
+        majority_conflict_attention = pd.DataFrame()
+        majority_conflict_drift = pd.DataFrame()
         """
     ),
     code_cell(
@@ -1211,6 +1616,263 @@ cells = [
                 pd.concat(attention_frames, ignore_index=True) if attention_frames else pd.DataFrame(),
                 pd.concat(drift_frames, ignore_index=True) if drift_frames else pd.DataFrame(),
             )
+
+
+        def run_forced_decoy_density_sweep(
+            model: torch.nn.Module,
+            tokenizer: Any,
+            examples: list[dict[str, Any]],
+            config: ExperimentConfig,
+            device: str,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            results: list[dict[str, Any]] = []
+            attention_frames: list[pd.DataFrame] = []
+            drift_frames: list[pd.DataFrame] = []
+            baseline_states: dict[tuple[str, str], torch.Tensor] = {}
+
+            total_cases = len(config.filler_types) * len(config.forced_decoy_counts) * len(examples)
+            progress = tqdm(total=total_cases, desc="forced decoy sweep")
+
+            for filler_type in config.filler_types:
+                for decoy_count in config.forced_decoy_counts:
+                    for example_index, example in enumerate(examples):
+                        prompt_package = build_forced_decoy_density_prompt(
+                            tokenizer=tokenizer,
+                            example=example,
+                            total_tokens=config.forced_decoy_total_length,
+                            decoy_count=decoy_count,
+                            answer_position=config.forced_decoy_answer_position,
+                            filler_type=filler_type,
+                            seed=config.seed + example_index * 50_000 + decoy_count,
+                        )
+                        baseline_key = (filler_type, example["example_id"])
+                        is_probe = (
+                            example_index < config.attention_probe_examples
+                            and config.forced_decoy_total_length <= config.attention_max_prompt_tokens
+                        )
+                        row, states, attention_detail, drift_detail = evaluate_prompt_case(
+                            model=model,
+                            tokenizer=tokenizer,
+                            prompt_package=prompt_package,
+                            device=device,
+                            experiment="forced_decoy_sweep",
+                            baseline_states=baseline_states.get(baseline_key),
+                            collect_attentions=is_probe,
+                            metadata={
+                                "example_id": example["example_id"],
+                                "filler_type": filler_type,
+                                "decoy_count": decoy_count,
+                                "total_tokens": config.forced_decoy_total_length,
+                            },
+                        )
+                        if decoy_count == min(config.forced_decoy_counts):
+                            baseline_states[baseline_key] = states
+                        if not attention_detail.empty:
+                            attention_frames.append(attention_detail.assign(
+                                example_id=example["example_id"],
+                                filler_type=filler_type,
+                                decoy_count=decoy_count,
+                                total_tokens=config.forced_decoy_total_length,
+                                experiment="forced_decoy_sweep",
+                            ))
+                        if not drift_detail.empty:
+                            drift_frames.append(drift_detail.assign(
+                                experiment="forced_decoy_sweep",
+                                decoy_count=decoy_count,
+                                total_tokens=config.forced_decoy_total_length,
+                                filler_type=filler_type,
+                                example_id=example["example_id"],
+                            ))
+                        results.append(row)
+                        progress.update(1)
+
+            progress.close()
+            return (
+                pd.DataFrame(results),
+                pd.concat(attention_frames, ignore_index=True) if attention_frames else pd.DataFrame(),
+                pd.concat(drift_frames, ignore_index=True) if drift_frames else pd.DataFrame(),
+            )
+
+
+        def run_answer_like_sink_sweep(
+            model: torch.nn.Module,
+            tokenizer: Any,
+            examples: list[dict[str, Any]],
+            config: ExperimentConfig,
+            device: str,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            results: list[dict[str, Any]] = []
+            attention_frames: list[pd.DataFrame] = []
+            drift_frames: list[pd.DataFrame] = []
+            baseline_states: dict[tuple[str, str], torch.Tensor] = {}
+
+            total_cases = len(config.filler_types) * len(config.answer_like_sink_prefix_lengths) * len(examples)
+            progress = tqdm(total=total_cases, desc="answer-like sink sweep")
+
+            for filler_type in config.filler_types:
+                for sink_prefix_tokens in config.answer_like_sink_prefix_lengths:
+                    for example_index, example in enumerate(examples):
+                        prompt_package = build_answer_like_sink_prompt(
+                            tokenizer=tokenizer,
+                            example=example,
+                            total_tokens=config.answer_like_sink_total_length,
+                            sink_prefix_tokens=sink_prefix_tokens,
+                            answer_position=config.answer_like_sink_answer_position,
+                            filler_type=filler_type,
+                            seed=config.seed + example_index * 60_000 + sink_prefix_tokens,
+                        )
+                        baseline_key = (filler_type, example["example_id"])
+                        is_probe = (
+                            example_index < config.attention_probe_examples
+                            and config.answer_like_sink_total_length <= config.attention_max_prompt_tokens
+                        )
+                        row, states, attention_detail, drift_detail = evaluate_prompt_case(
+                            model=model,
+                            tokenizer=tokenizer,
+                            prompt_package=prompt_package,
+                            device=device,
+                            experiment="answer_like_sink_sweep",
+                            baseline_states=baseline_states.get(baseline_key),
+                            collect_attentions=is_probe,
+                            metadata={
+                                "example_id": example["example_id"],
+                                "filler_type": filler_type,
+                                "answer_like_sink_tokens": sink_prefix_tokens,
+                                "total_tokens": config.answer_like_sink_total_length,
+                            },
+                        )
+                        if sink_prefix_tokens == min(config.answer_like_sink_prefix_lengths):
+                            baseline_states[baseline_key] = states
+                        if not attention_detail.empty:
+                            attention_frames.append(attention_detail.assign(
+                                example_id=example["example_id"],
+                                filler_type=filler_type,
+                                answer_like_sink_tokens=sink_prefix_tokens,
+                                total_tokens=config.answer_like_sink_total_length,
+                                experiment="answer_like_sink_sweep",
+                            ))
+                        if not drift_detail.empty:
+                            drift_frames.append(drift_detail.assign(
+                                experiment="answer_like_sink_sweep",
+                                answer_like_sink_tokens=sink_prefix_tokens,
+                                total_tokens=config.answer_like_sink_total_length,
+                                filler_type=filler_type,
+                                example_id=example["example_id"],
+                            ))
+                        results.append(row)
+                        progress.update(1)
+
+            progress.close()
+            return (
+                pd.DataFrame(results),
+                pd.concat(attention_frames, ignore_index=True) if attention_frames else pd.DataFrame(),
+                pd.concat(drift_frames, ignore_index=True) if drift_frames else pd.DataFrame(),
+            )
+
+
+        def run_majority_conflict_sweep(
+            model: torch.nn.Module,
+            tokenizer: Any,
+            examples: list[dict[str, Any]],
+            config: ExperimentConfig,
+            device: str,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            results: list[dict[str, Any]] = []
+            attention_frames: list[pd.DataFrame] = []
+            drift_frames: list[pd.DataFrame] = []
+            baseline_states: dict[tuple[str, str], torch.Tensor] = {}
+
+            total_cases = len(config.filler_types) * len(config.majority_conflict_repeats) * len(examples)
+            progress = tqdm(total=total_cases, desc="majority conflict sweep")
+
+            for filler_type in config.filler_types:
+                for majority_repeats in config.majority_conflict_repeats:
+                    for example_index, example in enumerate(examples):
+                        prompt_package = build_majority_conflict_prompt(
+                            tokenizer=tokenizer,
+                            example=example,
+                            total_tokens=config.majority_conflict_total_length,
+                            majority_repeats=majority_repeats,
+                            answer_position=config.majority_conflict_answer_position,
+                            filler_type=filler_type,
+                            seed=config.seed + example_index * 70_000 + majority_repeats,
+                        )
+                        baseline_key = (filler_type, example["example_id"])
+                        is_probe = (
+                            example_index < config.attention_probe_examples
+                            and config.majority_conflict_total_length <= config.attention_max_prompt_tokens
+                        )
+                        row, states, attention_detail, drift_detail = evaluate_prompt_case(
+                            model=model,
+                            tokenizer=tokenizer,
+                            prompt_package=prompt_package,
+                            device=device,
+                            experiment="majority_conflict_sweep",
+                            baseline_states=baseline_states.get(baseline_key),
+                            collect_attentions=is_probe,
+                            metadata={
+                                "example_id": example["example_id"],
+                                "filler_type": filler_type,
+                                "majority_repeats": majority_repeats,
+                                "total_tokens": config.majority_conflict_total_length,
+                            },
+                        )
+                        candidate_scores = score_candidate_answers(
+                            model=model,
+                            tokenizer=tokenizer,
+                            prompt_ids=prompt_package["prompt_ids"],
+                            candidate_answers={
+                                "correct": example["answer"],
+                                "majority_decoy": prompt_package["majority_decoy_answer"],
+                            },
+                            device=device,
+                        )
+                        predicted_answer_type = max(
+                            candidate_scores,
+                            key=lambda label: candidate_scores[label]["mean_token_logprob"],
+                        )
+                        row.update(
+                            {
+                                "majority_decoy_answer": prompt_package["majority_decoy_answer"],
+                                "predicted_answer_type": predicted_answer_type,
+                                "correct_mean_token_logprob": candidate_scores["correct"]["mean_token_logprob"],
+                                "majority_decoy_mean_token_logprob": candidate_scores["majority_decoy"]["mean_token_logprob"],
+                                "correct_sequence_logprob": candidate_scores["correct"]["sequence_logprob"],
+                                "majority_decoy_sequence_logprob": candidate_scores["majority_decoy"]["sequence_logprob"],
+                                "candidate_margin": (
+                                    candidate_scores["correct"]["mean_token_logprob"]
+                                    - candidate_scores["majority_decoy"]["mean_token_logprob"]
+                                ),
+                                "candidate_exact_match": predicted_answer_type == "correct",
+                            }
+                        )
+                        if majority_repeats == min(config.majority_conflict_repeats):
+                            baseline_states[baseline_key] = states
+                        if not attention_detail.empty:
+                            attention_frames.append(attention_detail.assign(
+                                example_id=example["example_id"],
+                                filler_type=filler_type,
+                                majority_repeats=majority_repeats,
+                                total_tokens=config.majority_conflict_total_length,
+                                experiment="majority_conflict_sweep",
+                            ))
+                        if not drift_detail.empty:
+                            drift_frames.append(drift_detail.assign(
+                                experiment="majority_conflict_sweep",
+                                majority_repeats=majority_repeats,
+                                total_tokens=config.majority_conflict_total_length,
+                                filler_type=filler_type,
+                                example_id=example["example_id"],
+                            ))
+                        results.append(row)
+                        progress.update(1)
+
+            progress.close()
+            return (
+                pd.DataFrame(results),
+                pd.concat(attention_frames, ignore_index=True) if attention_frames else pd.DataFrame(),
+                pd.concat(drift_frames, ignore_index=True) if drift_frames else pd.DataFrame(),
+            )
         """
     ),
     markdown_cell(
@@ -1306,6 +1968,79 @@ cells = [
     ),
     markdown_cell(
         """
+        ## Phase II: Forced Context-Bloat Attacks
+
+        Experiments 1 to 4 are mostly diagnostic: they reveal position bias, length sensitivity, competition failures, and sink behavior when those effects emerge naturally.
+
+        The next experiments are intentionally adversarial. Their goal is to force stronger context-bloat-like failures so you can study the internal activations in a regime where the model is under clearer retrieval pressure.
+        """
+    ),
+    markdown_cell(
+        """
+        ## Experiment 5: Forced Decoy Density Sweep
+
+        We keep one verified record but add increasing numbers of answer-shaped stale records that share the same schema and lexical pattern.
+
+        This is designed to stress retrieval competition around the correct answer without changing the answer itself.
+        """
+    ),
+    code_cell(
+        """
+        forced_decoy_results, forced_decoy_attention, forced_decoy_drift = run_forced_decoy_density_sweep(
+            model=model,
+            tokenizer=tokenizer,
+            examples=examples,
+            config=CONFIG,
+            device=DEVICE,
+        )
+        forced_decoy_results.head()
+        """
+    ),
+    markdown_cell(
+        """
+        ## Experiment 6: Answer-Like Sink Sweep
+
+        The original sink test used meaningless repeated headers.
+        This variant makes the sink much more tempting by repeating stale answer-like prefixes near the start of the prompt.
+
+        If the model starts over-attending to those early answer-like spans, this should produce a stronger sink effect than Experiment 4.
+        """
+    ),
+    code_cell(
+        """
+        answer_like_sink_results, answer_like_sink_attention, answer_like_sink_drift = run_answer_like_sink_sweep(
+            model=model,
+            tokenizer=tokenizer,
+            examples=examples,
+            config=CONFIG,
+            device=DEVICE,
+        )
+        answer_like_sink_results.head()
+        """
+    ),
+    markdown_cell(
+        """
+        ## Experiment 7: Majority-Conflict Sweep
+
+        We place one verified correct record in context, then repeat the same wrong answer in multiple stale copies after it.
+
+        This is intended to force a frequency-plus-recency failure mode: the model has to ignore a repeated wrong answer and still retrieve the one verified answer.
+        """
+    ),
+    code_cell(
+        """
+        majority_conflict_results, majority_conflict_attention, majority_conflict_drift = run_majority_conflict_sweep(
+            model=model,
+            tokenizer=tokenizer,
+            examples=examples,
+            config=CONFIG,
+            device=DEVICE,
+        )
+        majority_conflict_results.head()
+        """
+    ),
+    markdown_cell(
+        """
         ## Persist Results
 
         Saving intermediate tables is helpful because long-context experiments are slow and you usually do not want to rerun everything after a plotting tweak.
@@ -1344,6 +2079,27 @@ cells = [
             save_dataframe(sink_attention, TABLE_DIR / "sink_attention.csv")
         if not sink_drift.empty:
             save_dataframe(sink_drift, TABLE_DIR / "sink_drift.csv")
+
+        if not forced_decoy_results.empty:
+            save_dataframe(forced_decoy_results, TABLE_DIR / "forced_decoy_results.csv")
+        if not forced_decoy_attention.empty:
+            save_dataframe(forced_decoy_attention, TABLE_DIR / "forced_decoy_attention.csv")
+        if not forced_decoy_drift.empty:
+            save_dataframe(forced_decoy_drift, TABLE_DIR / "forced_decoy_drift.csv")
+
+        if not answer_like_sink_results.empty:
+            save_dataframe(answer_like_sink_results, TABLE_DIR / "answer_like_sink_results.csv")
+        if not answer_like_sink_attention.empty:
+            save_dataframe(answer_like_sink_attention, TABLE_DIR / "answer_like_sink_attention.csv")
+        if not answer_like_sink_drift.empty:
+            save_dataframe(answer_like_sink_drift, TABLE_DIR / "answer_like_sink_drift.csv")
+
+        if not majority_conflict_results.empty:
+            save_dataframe(majority_conflict_results, TABLE_DIR / "majority_conflict_results.csv")
+        if not majority_conflict_attention.empty:
+            save_dataframe(majority_conflict_attention, TABLE_DIR / "majority_conflict_attention.csv")
+        if not majority_conflict_drift.empty:
+            save_dataframe(majority_conflict_drift, TABLE_DIR / "majority_conflict_drift.csv")
         """
     ),
     markdown_cell(
@@ -1443,6 +2199,96 @@ cells = [
             axes[1].set_xlabel("Sink prefix tokens")
             finalize_figure(fig, "sink_attention_summary.png")
             plt.show()
+
+
+        if not forced_decoy_results.empty:
+            summary = (
+                forced_decoy_results.groupby(["decoy_count", "filler_type"], as_index=False)
+                .agg(accuracy=("normalized_text_exact_match", "mean"))
+            )
+            fig, ax = plt.subplots(figsize=(7, 4))
+            sns.lineplot(data=summary, x="decoy_count", y="accuracy", hue="filler_type", marker="o", ax=ax)
+            ax.set_title("Forced Decoy Sweep Accuracy")
+            ax.set_ylabel("Normalized exact-match accuracy")
+            ax.set_xlabel("Injected decoy records")
+            finalize_figure(fig, "forced_decoy_accuracy.png")
+            plt.show()
+
+
+        if not answer_like_sink_results.empty:
+            summary = (
+                answer_like_sink_results.groupby(["answer_like_sink_tokens", "filler_type"], as_index=False)
+                .agg(accuracy=("normalized_text_exact_match", "mean"))
+            )
+            fig, ax = plt.subplots(figsize=(7, 4))
+            sns.lineplot(
+                data=summary,
+                x="answer_like_sink_tokens",
+                y="accuracy",
+                hue="filler_type",
+                marker="o",
+                ax=ax,
+            )
+            ax.set_title("Answer-Like Sink Accuracy")
+            ax.set_ylabel("Normalized exact-match accuracy")
+            ax.set_xlabel("Answer-like sink tokens")
+            finalize_figure(fig, "answer_like_sink_accuracy.png")
+            plt.show()
+
+
+        if not answer_like_sink_attention.empty:
+            summary = (
+                answer_like_sink_attention.groupby(["answer_like_sink_tokens"], as_index=False)
+                .agg(
+                    relevant_ratio=("relevant_ratio", "mean"),
+                    sink_over_relevant=("sink_over_relevant", "mean"),
+                )
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+            sns.lineplot(data=summary, x="answer_like_sink_tokens", y="relevant_ratio", marker="o", ax=axes[0])
+            axes[0].set_title("Answer-Like Sink: Relevant Attention")
+            axes[0].set_ylabel("Mean relevant attention ratio")
+            axes[0].set_xlabel("Answer-like sink tokens")
+            sns.lineplot(
+                data=summary,
+                x="answer_like_sink_tokens",
+                y="sink_over_relevant",
+                marker="o",
+                ax=axes[1],
+            )
+            axes[1].set_title("Answer-Like Sink: Sink Ratio")
+            axes[1].set_ylabel("Mean sink / relevant attention")
+            axes[1].set_xlabel("Answer-like sink tokens")
+            finalize_figure(fig, "answer_like_sink_attention_summary.png")
+            plt.show()
+
+
+        if not majority_conflict_results.empty:
+            summary = (
+                majority_conflict_results.groupby(["majority_repeats", "filler_type"], as_index=False)
+                .agg(
+                    accuracy=("normalized_text_exact_match", "mean"),
+                    candidate_accuracy=("candidate_exact_match", "mean"),
+                )
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+            sns.lineplot(data=summary, x="majority_repeats", y="accuracy", hue="filler_type", marker="o", ax=axes[0])
+            axes[0].set_title("Majority Conflict Exact Match")
+            axes[0].set_ylabel("Normalized exact-match accuracy")
+            axes[0].set_xlabel("Repeated stale copies")
+            sns.lineplot(
+                data=summary,
+                x="majority_repeats",
+                y="candidate_accuracy",
+                hue="filler_type",
+                marker="o",
+                ax=axes[1],
+            )
+            axes[1].set_title("Majority Conflict Candidate Accuracy")
+            axes[1].set_ylabel("Correct-vs-decoy scoring accuracy")
+            axes[1].set_xlabel("Repeated stale copies")
+            finalize_figure(fig, "majority_conflict_accuracy.png")
+            plt.show()
         """
     ),
     markdown_cell(
@@ -1455,6 +2301,12 @@ cells = [
         - the middle positions perform worse than the edges
         - relevant-span attention falls while sink attention rises
         - the final query-token representation drifts away from the short-context baseline
+
+        In the forced-bloat experiments, the same diagnostics should become easier to trigger:
+
+        - Experiment 5 should fail more often as decoy density rises
+        - Experiment 6 should show stronger sink ratios than the plain sink-prefix baseline
+        - Experiment 7 should make the model prefer the repeated stale answer unless retrieval remains robust
 
         If you want to push this further, the next clean extensions are:
 

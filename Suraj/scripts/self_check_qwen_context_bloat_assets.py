@@ -59,6 +59,15 @@ def main() -> None:
         "Notebook plots should aggregate normalized_text_exact_match.",
     )
     require("front_mean_token_logprob" in notebook_text, "Competition scoring fields are missing.")
+    require("## Experiment 5: Forced Decoy Density Sweep" in notebook_text, "Notebook is missing Experiment 5.")
+    require("## Experiment 6: Answer-Like Sink Sweep" in notebook_text, "Notebook is missing Experiment 6.")
+    require("## Experiment 7: Majority-Conflict Sweep" in notebook_text, "Notebook is missing Experiment 7.")
+    require("forced_decoy_results.csv" in notebook_text, "Notebook is missing forced decoy persistence.")
+    require("answer_like_sink_results.csv" in notebook_text, "Notebook is missing answer-like sink persistence.")
+    require("majority_conflict_results.csv" in notebook_text, "Notebook is missing majority conflict persistence.")
+    require("forced_decoy_accuracy.png" in notebook_text, "Notebook is missing forced decoy plotting.")
+    require("answer_like_sink_accuracy.png" in notebook_text, "Notebook is missing answer-like sink plotting.")
+    require("majority_conflict_accuracy.png" in notebook_text, "Notebook is missing majority conflict plotting.")
     require("ipywidgets==8.1.7" in env_text, "environment.yml should include ipywidgets.")
 
     run_command([sys.executable, "-m", "py_compile", str(GENERATOR)])
