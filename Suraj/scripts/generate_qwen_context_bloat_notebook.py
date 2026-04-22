@@ -89,7 +89,7 @@ cells = [
         import seaborn as sns
         import torch
         import torch.nn.functional as F
-        from tqdm.auto import tqdm
+        from tqdm import tqdm
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -190,8 +190,32 @@ cells = [
             return torch.float32
 
 
+        def extract_answer_candidate(text: str) -> str:
+            stripped = text.strip()
+            if not stripped:
+                return ""
+
+            first_nonempty_line = ""
+            for line in stripped.splitlines():
+                candidate = line.strip()
+                if candidate:
+                    first_nonempty_line = candidate
+                    break
+
+            if not first_nonempty_line:
+                return ""
+
+            if ":" in first_nonempty_line:
+                prefix, suffix = first_nonempty_line.split(":", 1)
+                if prefix.strip().upper() in {"ANSWER", "SECURITY ANSWER"}:
+                    first_nonempty_line = suffix.strip()
+
+            return first_nonempty_line.strip().strip("`\"'.,;:!?()[]{}")
+
+
         def normalize_text(text: str) -> str:
-            return " ".join(text.strip().split()).upper()
+            normalized = extract_answer_candidate(text)
+            return " ".join(normalized.strip().split()).upper()
 
 
         seed_everything(CONFIG.seed)
@@ -750,13 +774,24 @@ cells = [
                 sink_span=prompt_package["sink_span"],
             )
 
+            generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            generated_answer_text = extract_answer_candidate(generated_text)
+            token_exact_match = generated_ids[: len(answer_ids)] == answer_ids
+            normalized_text_exact_match = (
+                normalize_text(generated_answer_text) == normalize_text(prompt_package["answer_text"])
+            )
+
             row = {
                 "experiment": experiment,
                 "prompt_tokens": len(prompt_ids),
                 "observed_answer_position": prompt_package["observed_answer_position"],
                 "answer_text": prompt_package["answer_text"],
-                "generated_text": tokenizer.decode(generated_ids, skip_special_tokens=True).strip(),
-                "exact_match": generated_ids[: len(answer_ids)] == answer_ids,
+                "generated_text": generated_text,
+                "generated_answer_text": generated_answer_text,
+                "token_exact_match": token_exact_match,
+                "normalized_text_exact_match": normalized_text_exact_match,
+                # Keep an `exact_match` alias so downstream cells stay simple.
+                "exact_match": normalized_text_exact_match,
                 "sequence_logprob": logprob_stats["sequence_logprob"],
                 "mean_token_logprob": logprob_stats["mean_token_logprob"],
                 "first_token_entropy": logprob_stats["first_token_entropy"],
@@ -798,8 +833,8 @@ cells = [
             prompt_ids: list[int],
             candidate_answers: dict[str, str],
             device: str,
-        ) -> dict[str, float]:
-            scores: dict[str, float] = {}
+        ) -> dict[str, dict[str, float]]:
+            scores: dict[str, dict[str, float]] = {}
             for label, answer_text in candidate_answers.items():
                 answer_ids = encode_text(tokenizer, answer_text)
                 scores[label] = compute_answer_logprob(
@@ -807,7 +842,7 @@ cells = [
                     prompt_ids=prompt_ids,
                     answer_ids=answer_ids,
                     device=device,
-                )["sequence_logprob"]
+                )
             return scores
         """
     ),
@@ -1059,15 +1094,28 @@ cells = [
                             candidate_answers=prompt_package["candidate_answers"],
                             device=device,
                         )
-                        predicted_location = max(scores, key=scores.get)
-                        sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+                        predicted_location = max(
+                            scores,
+                            key=lambda label: scores[label]["mean_token_logprob"],
+                        )
+                        sorted_locations = sorted(
+                            scores,
+                            key=lambda label: scores[label]["mean_token_logprob"],
+                            reverse=True,
+                        )
                         row.update(
                             {
                                 "predicted_location": predicted_location,
-                                "candidate_margin": sorted_scores[0][1] - sorted_scores[1][1],
-                                "front_logprob": scores["front"],
-                                "middle_logprob": scores["middle"],
-                                "back_logprob": scores["back"],
+                                "candidate_margin": (
+                                    scores[sorted_locations[0]]["mean_token_logprob"]
+                                    - scores[sorted_locations[1]]["mean_token_logprob"]
+                                ),
+                                "front_mean_token_logprob": scores["front"]["mean_token_logprob"],
+                                "middle_mean_token_logprob": scores["middle"]["mean_token_logprob"],
+                                "back_mean_token_logprob": scores["back"]["mean_token_logprob"],
+                                "front_sequence_logprob": scores["front"]["sequence_logprob"],
+                                "middle_sequence_logprob": scores["middle"]["sequence_logprob"],
+                                "back_sequence_logprob": scores["back"]["sequence_logprob"],
                                 "candidate_exact_match": predicted_location == correct_location,
                             }
                         )
@@ -1323,12 +1371,12 @@ cells = [
         if not position_results.empty:
             summary = (
                 position_results.groupby(["total_tokens", "position_ratio"], as_index=False)
-                .agg(accuracy=("exact_match", "mean"))
+                .agg(accuracy=("normalized_text_exact_match", "mean"))
             )
             fig, ax = plt.subplots(figsize=(7, 4))
             sns.lineplot(data=summary, x="position_ratio", y="accuracy", hue="total_tokens", marker="o", ax=ax)
             ax.set_title("Position Sweep Accuracy")
-            ax.set_ylabel("Exact-match accuracy")
+            ax.set_ylabel("Normalized exact-match accuracy")
             ax.set_xlabel("Target answer position")
             finalize_figure(fig, "position_accuracy.png")
             plt.show()
@@ -1337,12 +1385,12 @@ cells = [
         if not bloat_results.empty:
             summary = (
                 bloat_results.groupby(["total_tokens", "filler_type"], as_index=False)
-                .agg(accuracy=("exact_match", "mean"))
+                .agg(accuracy=("normalized_text_exact_match", "mean"))
             )
             fig, ax = plt.subplots(figsize=(7, 4))
             sns.lineplot(data=summary, x="total_tokens", y="accuracy", hue="filler_type", marker="o", ax=ax)
             ax.set_title("Bloat Sweep Accuracy")
-            ax.set_ylabel("Exact-match accuracy")
+            ax.set_ylabel("Normalized exact-match accuracy")
             ax.set_xlabel("Total prompt tokens")
             finalize_figure(fig, "bloat_accuracy.png")
             plt.show()
@@ -1351,12 +1399,12 @@ cells = [
         if not sink_results.empty:
             summary = (
                 sink_results.groupby(["sink_prefix_tokens", "filler_type"], as_index=False)
-                .agg(accuracy=("exact_match", "mean"))
+                .agg(accuracy=("normalized_text_exact_match", "mean"))
             )
             fig, ax = plt.subplots(figsize=(7, 4))
             sns.lineplot(data=summary, x="sink_prefix_tokens", y="accuracy", hue="filler_type", marker="o", ax=ax)
             ax.set_title("Sink Stress Accuracy")
-            ax.set_ylabel("Exact-match accuracy")
+            ax.set_ylabel("Normalized exact-match accuracy")
             ax.set_xlabel("Sink prefix tokens")
             finalize_figure(fig, "sink_accuracy.png")
             plt.show()
